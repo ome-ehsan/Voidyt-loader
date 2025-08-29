@@ -7,12 +7,112 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 const TEMP_DIR = path.join(__dirname, 'temp');
-//const ytdelp = "C:\\yt-dlp\\yt-dlp.exe";
-const ytdelp = 'yt-dlp';
+
+// Dynamic User Agent Pool - rotates automatically
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15'
+];
+
+// Get random user agent
+function getRandomUserAgent() {
+    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+// Dynamic configuration that adapts
+function getYtDlpConfig() {
+    const userAgent = getRandomUserAgent();
+    const randomDelay = Math.floor(Math.random() * 3) + 1; // 1-3 seconds
+    
+    return {
+        userAgent,
+        commonArgs: [
+            '--user-agent', userAgent,
+            '--referer', 'https://www.youtube.com/',
+            '--add-header', 'Accept-Language:en-US,en;q=0.9',
+            '--add-header', 'Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            '--sleep-interval', randomDelay.toString(),
+            '--max-sleep-interval', '5',
+            '--extractor-args', 'youtube:player_skip=webpage,configs',
+            '--no-check-certificate',
+            '--geo-bypass',
+            '--socket-timeout', '30',
+            '--retries', '3',
+            '--fragment-retries', '3'
+        ]
+    };
+}
+
+// Auto-update yt-dlp periodically
+let lastUpdateCheck = 0;
+const UPDATE_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
+
+async function updateYtDlp() {
+    const now = Date.now();
+    if (now - lastUpdateCheck < UPDATE_INTERVAL) {
+        return; // Skip if updated recently
+    }
+    
+    try {
+        console.log('Checking for yt-dlp updates...');
+        const updateProcess = spawn('pip3', ['install', '--upgrade', 'yt-dlp'], {
+            stdio: 'pipe'
+        });
+        
+        updateProcess.on('close', (code) => {
+            if (code === 0) {
+                console.log('yt-dlp updated successfully');
+                lastUpdateCheck = now;
+            } else {
+                console.log('yt-dlp update check completed');
+            }
+        });
+    } catch (error) {
+        console.error('Error updating yt-dlp:', error.message);
+    }
+}
+
+// Fallback strategies for different error types
+function getRetryArgs(attempt = 0) {
+    const config = getYtDlpConfig();
+    let additionalArgs = [];
+    
+    switch (attempt) {
+        case 1:
+            // First retry: Use IPv4 only
+            additionalArgs = ['--force-ipv4'];
+            break;
+        case 2:
+            // Second retry: Try different extraction method
+            additionalArgs = ['--force-ipv6', '--extractor-args', 'youtube:player_client=web'];
+            break;
+        // case 3:
+        //     // Third retry: More aggressive approach
+        //     additionalArgs = [
+        //         '--cookies-from-browser', 'chrome',
+        //         '--extractor-args', 'youtube:player_client=android'
+        //     ];
+        //     break;
+        default:
+            break;
+    }
+    
+    return [...config.commonArgs, ...additionalArgs];
+}
+
+
 // Middleware
 app.use(express.json());
 app.use(express.static('public'));
 app.use('/temp', express.static(TEMP_DIR));
+
+// Serve static files from root for background image
+app.use(express.static(__dirname));
 
 // Ensure temp directory exists
 async function ensureTempDir() {
@@ -56,10 +156,16 @@ function isValidYouTubeURL(url) {
     return patterns.some(pattern => pattern.test(url));
 }
 
-// Get available formats for the video
-function getAvailableFormats(url) {
+// Get video info with retry logic
+function getVideoInfo(url, attempt = 0) {
     return new Promise((resolve, reject) => {
-        const ytdlp = spawn(ytdelp, ['-F', '--no-playlist', url]);
+        if (attempt >= 3) {
+            return reject(new Error('Max retry attempts reached'));
+        }
+        
+        const args = ['--dump-json', '--no-playlist', ...getRetryArgs(attempt), url];
+        const ytdlp = spawn('yt-dlp', args);
+        
         let stdout = '';
         let stderr = '';
         
@@ -73,117 +179,71 @@ function getAvailableFormats(url) {
         
         ytdlp.on('close', (code) => {
             if (code === 0) {
-                resolve(stdout);
-            } else {
-                reject(new Error(`Failed to get formats: ${stderr}`));
-            }
-        });
-    });
-}
-
-// Get video info including available qualities
-function getVideoInfo(url) {
-    return new Promise((resolve, reject) => {
-        const ytdlp = spawn(ytdelp, ['--dump-json', '--no-playlist', url]);
-        let stdout = '';
-        let stderr = '';
-        
-        ytdlp.stdout.on('data', (data) => {
-            stdout += data.toString();
-        });
-        
-        ytdlp.stderr.on('data', (data) => {
-            stderr += data.toString();
-        });
-        
-        ytdlp.on('close', async (code) => {
-            if (code === 0) {
                 try {
                     const info = JSON.parse(stdout);
-                    
-                    // Get available video qualities
-                    const availableQualities = [];
-                    if (info.formats) {
-                        const videoFormats = info.formats
-                            .filter(f => f.vcodec !== 'none' && f.height)
-                            .sort((a, b) => (b.height || 0) - (a.height || 0));
-                        
-                        const uniqueQualities = [...new Set(videoFormats.map(f => f.height))];
-                        availableQualities.push(...uniqueQualities.map(height => `${height}p`));
-                    }
-                    
                     resolve({
                         title: info.title,
                         duration: info.duration,
                         uploader: info.uploader,
-                        thumbnail: info.thumbnail,
-                        availableQualities: availableQualities
+                        thumbnail: info.thumbnail
                     });
                 } catch (error) {
-                    reject(new Error('Failed to parse video info'));
+                    // Retry on parse error
+                    setTimeout(() => {
+                        getVideoInfo(url, attempt + 1).then(resolve).catch(reject);
+                    }, (attempt + 1) * 2000); // Progressive delay
                 }
             } else {
-                reject(new Error(`Failed to get video info: ${stderr}`));
+                // Check if it's a bot detection error
+                if (stderr.includes('Sign in to confirm') || stderr.includes('bot')) {
+                    console.log(`Bot detection on attempt ${attempt + 1}, retrying...`);
+                    setTimeout(() => {
+                        getVideoInfo(url, attempt + 1).then(resolve).catch(reject);
+                    }, (attempt + 1) * 3000); // Progressive delay for bot detection
+                } else {
+                    reject(new Error(`Failed to get video info: ${stderr}`));
+                }
             }
         });
     });
 }
 
-// Download video with specific quality
-function downloadVideo(url, outputPath, format = 'mp4', quality = 'best') {
+// Download video with retry logic
+function downloadVideo(url, outputPath, format = 'mp4', attempt = 0) {
     return new Promise((resolve, reject) => {
-        let args;
+        if (attempt >= 3) {
+            return reject(new Error('Max download attempts reached'));
+        }
+        
+        let formatArgs = [];
+        const retryArgs = getRetryArgs(attempt);
         
         if (format === 'mp3') {
-            // For MP3: get best audio and convert to true MP3
-            args = [
+            formatArgs = [
                 '--extract-audio',
                 '--audio-format', 'mp3',
-                '--audio-quality', '0',  // Best quality
+                '--audio-quality', '0',
                 '--embed-thumbnail',
-                '--add-metadata',
-                '-o', outputPath,
-                '--no-playlist',
-                url
+                '--add-metadata'
             ];
         } else {
-            // For video: Enhanced format selection for high quality
-            let formatSelector;
-            
-            if (quality === 'best') {
-                // Get the absolute best quality available
-                formatSelector = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best';
-            } else if (quality === '4k' || quality === '2160p') {
-                formatSelector = 'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160]';
-            } else if (quality === '1440p') {
-                formatSelector = 'bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1440]+bestaudio/best[height<=1440]';
-            } else if (quality === '1080p') {
-                formatSelector = 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]';
-            } else if (quality === '720p') {
-                formatSelector = 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]';
-            } else {
-                formatSelector = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best';
-            }
-            
-            args = [
-                '-f', formatSelector,
-                '--merge-output-format', 'mp4',
-                '-o', outputPath,
-                '--no-playlist',
-                '--prefer-ffmpeg',  // Use ffmpeg for better merging
-                '--ffmpeg-location', 'ffmpeg',  // Assumes ffmpeg is in PATH
-                url
+            formatArgs = [
+                '-f', 'best[ext=mp4]/best',
+                '--merge-output-format', 'mp4'
             ];
         }
         
-        console.log('yt-dlp command:', ytdelp, args.join(' '));
+        const args = [
+            ...formatArgs,
+            ...retryArgs,
+            '-o', outputPath,
+            '--no-playlist',
+            url
+        ];
         
-        const ytdlp = spawn(ytdelp, args);
+        const ytdlp = spawn('yt-dlp', args);
+        
         let stderr = '';
-        
-        ytdlp.stdout.on('data', (data) => {
-            console.log('yt-dlp stdout:', data.toString());
-        });
         
         ytdlp.stderr.on('data', (data) => {
             stderr += data.toString();
@@ -194,7 +254,15 @@ function downloadVideo(url, outputPath, format = 'mp4', quality = 'best') {
             if (code === 0) {
                 resolve();
             } else {
-                reject(new Error(`Download failed: ${stderr}`));
+                // Check if it's a bot detection error and retry
+                if ((stderr.includes('Sign in to confirm') || stderr.includes('bot')) && attempt < 2) {
+                    console.log(`Download bot detection on attempt ${attempt + 1}, retrying...`);
+                    setTimeout(() => {
+                        downloadVideo(url, outputPath, format, attempt + 1).then(resolve).catch(reject);
+                    }, (attempt + 1) * 5000);
+                } else {
+                    reject(new Error(`Download failed: ${stderr}`));
+                }
             }
         });
     });
@@ -225,25 +293,9 @@ app.post('/api/video-info', async (req, res) => {
     }
 });
 
-app.post('/api/formats', async (req, res) => {
-    try {
-        const { url } = req.body;
-        
-        if (!url || !isValidYouTubeURL(url)) {
-            return res.status(400).json({ error: 'Invalid YouTube URL' });
-        }
-        
-        const formats = await getAvailableFormats(url);
-        res.json({ formats });
-    } catch (error) {
-        console.error('Error getting formats:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
 app.post('/api/download', async (req, res) => {
     try {
-        const { url, format, quality = 'best' } = req.body;
+        const { url, format } = req.body;
         
         if (!url || !isValidYouTubeURL(url)) {
             return res.status(400).json({ error: 'Invalid YouTube URL' });
@@ -251,11 +303,6 @@ app.post('/api/download', async (req, res) => {
         
         if (!['mp4', 'mp3'].includes(format)) {
             return res.status(400).json({ error: 'Invalid format. Use mp4 or mp3' });
-        }
-        
-        const validQualities = ['best', '2160p', '4k', '1440p', '1080p', '720p', '480p', '360p'];
-        if (format === 'mp4' && !validQualities.includes(quality)) {
-            return res.status(400).json({ error: 'Invalid quality. Use: ' + validQualities.join(', ') });
         }
         
         // Get video info first
@@ -266,48 +313,21 @@ app.post('/api/download', async (req, res) => {
         const timestamp = Date.now();
         const hash = crypto.randomBytes(4).toString('hex');
         const extension = format;
-        const qualityTag = format === 'mp4' ? `_${quality}` : '';
-        const filename = `${safeTitle}_${timestamp}_${hash}${qualityTag}.${extension}`;
-        const outputPath = path.join(TEMP_DIR, `${safeTitle}_${timestamp}_${hash}${qualityTag}.%(ext)s`);
+        const filename = `${safeTitle}_${timestamp}_${hash}.${extension}`;
+        const outputPath = path.join(TEMP_DIR, `${safeTitle}_${timestamp}_${hash}.%(ext)s`);
         
         // Download the file
-        await downloadVideo(url, outputPath, format, quality);
+        await downloadVideo(url, outputPath, format);
         
         // Find the actual downloaded file
         const files = await fs.readdir(TEMP_DIR);
-        console.log('Files in temp directory:', files);
-        console.log('Looking for files containing:', `${safeTitle}_${timestamp}_${hash}`);
-        
-        const downloadedFile = files.find(file => {
-            const matchesPattern = file.includes(`${safeTitle}_${timestamp}_${hash}`);
-            const hasCorrectExtension = file.endsWith(`.${extension}`);
-            console.log(`Checking file: ${file}, matches pattern: ${matchesPattern}, correct extension: ${hasCorrectExtension}`);
-            return matchesPattern && hasCorrectExtension;
-        });
+        const downloadedFile = files.find(file => 
+            file.includes(`${safeTitle}_${timestamp}_${hash}`) && 
+            file.endsWith(`.${extension}`)
+        );
         
         if (!downloadedFile) {
-            // Try to find any file with the timestamp and hash (in case extension differs)
-            const alternativeFile = files.find(file => 
-                file.includes(`${timestamp}_${hash}`)
-            );
-            
-            if (alternativeFile) {
-                console.log('Found alternative file:', alternativeFile);
-                const actualExtension = path.extname(alternativeFile).substring(1);
-                const downloadUrl = `/temp/${alternativeFile}`;
-                
-                return res.json({
-                    success: true,
-                    filename: alternativeFile,
-                    downloadUrl: downloadUrl,
-                    title: info.title,
-                    quality: quality,
-                    format: actualExtension,
-                    note: `Downloaded as ${actualExtension} instead of requested ${extension}`
-                });
-            }
-            
-            throw new Error(`Downloaded file not found. Available files: ${files.join(', ')}`);
+            throw new Error('Downloaded file not found');
         }
         
         const downloadUrl = `/temp/${downloadedFile}`;
@@ -316,27 +336,12 @@ app.post('/api/download', async (req, res) => {
             success: true,
             filename: downloadedFile,
             downloadUrl: downloadUrl,
-            title: info.title,
-            quality: quality,
-            format: format
+            title: info.title
         });
         
     } catch (error) {
         console.error('Error downloading:', error);
-        console.error('Error stack:', error.stack);
-        
-        // Try to list files in temp directory for debugging
-        try {
-            const files = await fs.readdir(TEMP_DIR);
-            console.log('Available files in temp directory:', files);
-        } catch (fsError) {
-            console.error('Could not read temp directory:', fsError);
-        }
-        
-        res.status(500).json({ 
-            error: error.message,
-            details: 'Check server console for more information'
-        });
+        res.status(500).json({ error: error.message });
     }
 });
 
@@ -345,11 +350,16 @@ app.listen(PORT, async () => {
     console.log(`Server running on port ${PORT}`);
     await ensureTempDir();
     
+    // Update yt-dlp on startup
+    await updateYtDlp();
+    
     // Clean up old files every 15 minutes
     setInterval(cleanupOldFiles, 15 * 60 * 1000);
     
-    console.log('YouTube Downloader Server is ready!');
-    console.log('Note: Make sure ffmpeg is installed and available in your PATH for best results');
+    // Check for yt-dlp updates every 6 hours
+    setInterval(updateYtDlp, 6 * 60 * 60 * 1000);
+    
+    console.log('VOID\'s YT LOADER Server is ready with smart anti-detection!');
 });
 
 module.exports = app;
