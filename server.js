@@ -160,27 +160,43 @@ function isValidYouTubeURL(url) {
 function getVideoInfo(url, attempt = 0) {
     return new Promise((resolve, reject) => {
         if (attempt >= 3) {
+            console.error(`[VIDEO_INFO] Max attempts reached for URL: ${url}`);
             return reject(new Error('Max retry attempts reached'));
         }
-        
+
+        console.log(`[VIDEO_INFO] Attempt ${attempt + 1} for URL: ${url}`);
+
         const args = ['--dump-json', '--no-playlist', ...getRetryArgs(attempt), url];
+        console.log(`[VIDEO_INFO] yt-dlp command: yt-dlp ${args.join(' ')}`);
+
         const ytdlp = spawn('yt-dlp', args);
-        
+
         let stdout = '';
         let stderr = '';
-        
+
         ytdlp.stdout.on('data', (data) => {
             stdout += data.toString();
+            console.log(`[VIDEO_INFO] stdout: ${data.toString().trim()}`);
         });
-        
+
         ytdlp.stderr.on('data', (data) => {
-            stderr += data.toString();
+            const dataStr = data.toString();
+            stderr += dataStr;
+            console.log(`[VIDEO_INFO] stderr: ${dataStr.trim()}`);
         });
-        
+
+        ytdlp.on('error', (error) => {
+            console.error(`[VIDEO_INFO] Spawn error: ${error.message}`);
+            console.error(`[VIDEO_INFO] Error code: ${error.code}, signal: ${error.signal}`);
+        });
+
         ytdlp.on('close', (code) => {
+            console.log(`[VIDEO_INFO] Process exited with code: ${code}`);
+
             if (code === 0) {
                 try {
                     const info = JSON.parse(stdout);
+                    console.log(`[VIDEO_INFO] Success on attempt ${attempt + 1}`);
                     resolve({
                         title: info.title,
                         duration: info.duration,
@@ -188,20 +204,25 @@ function getVideoInfo(url, attempt = 0) {
                         thumbnail: info.thumbnail
                     });
                 } catch (error) {
+                    console.error(`[VIDEO_INFO] JSON parse error: ${error.message}`);
                     // Retry on parse error
                     setTimeout(() => {
                         getVideoInfo(url, attempt + 1).then(resolve).catch(reject);
                     }, (attempt + 1) * 2000); // Progressive delay
                 }
             } else {
+                console.error(`[VIDEO_INFO] Failed with code ${code}`);
+                console.error(`[VIDEO_INFO] Full stderr: ${stderr}`);
+                console.error(`[VIDEO_INFO] Full stdout: ${stdout}`);
+
                 // Check if it's a bot detection error
                 if (stderr.includes('Sign in to confirm') || stderr.includes('bot')) {
-                    console.log(`Bot detection on attempt ${attempt + 1}, retrying...`);
+                    console.log(`[VIDEO_INFO] Bot detection detected, retrying...`);
                     setTimeout(() => {
                         getVideoInfo(url, attempt + 1).then(resolve).catch(reject);
                     }, (attempt + 1) * 3000); // Progressive delay for bot detection
                 } else {
-                    reject(new Error(`Failed to get video info: ${stderr}`));
+                    reject(new Error(`Failed to get video info (code ${code}): ${stderr.trim()}`));
                 }
             }
         });
@@ -212,12 +233,15 @@ function getVideoInfo(url, attempt = 0) {
 function downloadVideo(url, outputPath, format = 'mp4', attempt = 0) {
     return new Promise((resolve, reject) => {
         if (attempt >= 3) {
+            console.error(`[DOWNLOAD] Max attempts reached for URL: ${url}`);
             return reject(new Error('Max download attempts reached'));
         }
-        
+
+        console.log(`[DOWNLOAD] Attempt ${attempt + 1} for URL: ${url}, format: ${format}`);
+
         let formatArgs = [];
         const retryArgs = getRetryArgs(attempt);
-        
+
         if (format === 'mp3') {
             formatArgs = [
                 '--extract-audio',
@@ -232,7 +256,7 @@ function downloadVideo(url, outputPath, format = 'mp4', attempt = 0) {
                 '--merge-output-format', 'mp4'
             ];
         }
-        
+
         const args = [
             ...formatArgs,
             ...retryArgs,
@@ -240,28 +264,49 @@ function downloadVideo(url, outputPath, format = 'mp4', attempt = 0) {
             '--no-playlist',
             url
         ];
-        
+
+        console.log(`[DOWNLOAD] yt-dlp command: yt-dlp ${args.join(' ')}`);
+
         const ytdlp = spawn('yt-dlp', args);
-        
+
         let stderr = '';
-        
-        ytdlp.stderr.on('data', (data) => {
-            stderr += data.toString();
-            console.log('yt-dlp progress:', data.toString());
+        let stdout = '';
+
+        ytdlp.stdout.on('data', (data) => {
+            stdout += data.toString();
+            console.log(`[DOWNLOAD] stdout: ${data.toString().trim()}`);
         });
-        
+
+        ytdlp.stderr.on('data', (data) => {
+            const dataStr = data.toString();
+            stderr += dataStr;
+            console.log(`[DOWNLOAD] stderr: ${dataStr.trim()}`);
+        });
+
+        ytdlp.on('error', (error) => {
+            console.error(`[DOWNLOAD] Spawn error: ${error.message}`);
+            console.error(`[DOWNLOAD] Error code: ${error.code}, signal: ${error.signal}`);
+        });
+
         ytdlp.on('close', (code) => {
+            console.log(`[DOWNLOAD] Process exited with code: ${code}`);
+
             if (code === 0) {
+                console.log(`[DOWNLOAD] Success on attempt ${attempt + 1}`);
                 resolve();
             } else {
+                console.error(`[DOWNLOAD] Failed with code ${code}`);
+                console.error(`[DOWNLOAD] Full stderr: ${stderr}`);
+                console.error(`[DOWNLOAD] Full stdout: ${stdout}`);
+
                 // Check if it's a bot detection error and retry
                 if ((stderr.includes('Sign in to confirm') || stderr.includes('bot')) && attempt < 2) {
-                    console.log(`Download bot detection on attempt ${attempt + 1}, retrying...`);
+                    console.log(`[DOWNLOAD] Bot detection detected, retrying...`);
                     setTimeout(() => {
                         downloadVideo(url, outputPath, format, attempt + 1).then(resolve).catch(reject);
                     }, (attempt + 1) * 5000);
                 } else {
-                    reject(new Error(`Download failed: ${stderr}`));
+                    reject(new Error(`Download failed (code ${code}): ${stderr.trim()}`));
                 }
             }
         });
@@ -347,19 +392,51 @@ app.post('/api/download', async (req, res) => {
 
 // Start server
 app.listen(PORT, async () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`[STARTUP] Server running on port ${PORT}`);
+    console.log(`[STARTUP] Node version: ${process.version}`);
+    console.log(`[STARTUP] Platform: ${process.platform}`);
+    console.log(`[STARTUP] Environment: ${process.env.NODE_ENV || 'development'}`);
+
+    // Log environment details
+    try {
+        const { spawn } = require('child_process');
+        console.log('[STARTUP] Checking yt-dlp installation...');
+
+        const ytCheck = spawn('yt-dlp', ['--version']);
+        ytCheck.stdout.on('data', (data) => {
+            console.log(`[STARTUP] yt-dlp version: ${data.toString().trim()}`);
+        });
+        ytCheck.stderr.on('data', (data) => {
+            console.log(`[STARTUP] yt-dlp stderr: ${data.toString().trim()}`);
+        });
+        ytCheck.on('close', (code) => {
+            console.log(`[STARTUP] yt-dlp check exit code: ${code}`);
+        });
+
+        const pyCheck = spawn('python3', ['--version']);
+        pyCheck.stdout.on('data', (data) => {
+            console.log(`[STARTUP] Python version: ${data.toString().trim()}`);
+        });
+        pyCheck.on('close', (code) => {
+            console.log(`[STARTUP] Python check exit code: ${code}`);
+        });
+
+    } catch (error) {
+        console.error(`[STARTUP] Error checking versions: ${error.message}`);
+    }
+
     await ensureTempDir();
-    
+
     // Update yt-dlp on startup
     await updateYtDlp();
-    
+
     // Clean up old files every 15 minutes
     setInterval(cleanupOldFiles, 15 * 60 * 1000);
-    
+
     // Check for yt-dlp updates every 6 hours
     setInterval(updateYtDlp, 6 * 60 * 60 * 1000);
-    
-    console.log('VOID\'s YT LOADER Server is ready with smart anti-detection!');
+
+    console.log('[STARTUP] VOID\'s YT LOADER Server is ready with smart anti-detection!');
 });
 
 module.exports = app;
